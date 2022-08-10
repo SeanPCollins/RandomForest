@@ -110,9 +110,9 @@ class DecisionTree(object):
                                    total) ** 2 for x in res.keys()])
             self.scale_total = total
         else:
-            con_mat = sklm.confusion_matrix(self.data['Target'],
-                                            self.data['Predict'],
-                                            labels=self.out_o)
+            con_mat = self.con_mat(np.array(self.data['Target']),
+                                   np.array(self.data['Predict']),
+                                   N=len(self.out_o))
             self.score = 1 - self.calc_score(con_mat, metric)
         stime = start
         output = open('{}.out'.format(self.job_name), 'w')
@@ -159,13 +159,12 @@ class DecisionTree(object):
 
     def get_splits(self, metric):
         """Split the decision tree for that level"""
-        feats = list(self.class_idx.columns.levels[0])
-        score = self.score
+        feats, score = list(self.class_idx.columns.levels[0]), self.score
+        start = time()
         for path in sorted(set(self.data['Path'])):
             if any(x in path for x in ['R', 'L']):
                 continue
             cols = sorted(random.sample(feats, self.max_feats))
-
             other = self.data[self.data['Path'] != path]
             o_tar = other['Target']
             o_pred = other['Predict']
@@ -186,7 +185,8 @@ class DecisionTree(object):
                 out_o = self.out_o
                 con_mat = [[0] * len(out_o)] * len(out_o)
                 try:
-                    con_mat = sklm.confusion_matrix(o_tar, o_pred, labels=out_o)
+                    con_mat = self.con_mat(np.array(o_tar), np.array(o_pred),
+                                           N=len(out_o))
                     num, denom = 0, 0
                     for i, (j, k) in enumerate(zip(out_o, con_mat)):
                         num += self.scales[j] * k[i]
@@ -279,21 +279,26 @@ class DecisionTree(object):
         if sum(col) in [0, len(col)]:
             return '>= {}'.format(self.score)
         conds, scales = [col.isin([0]), col.isin([1])], self.scales
-        left, right = list(node_tar[conds[0]]), list(node_tar[conds[1]])
-        lres = dict(zip(*np.unique(left, return_counts=True)))
-        rres = dict(zip(*np.unique(right, return_counts=True)))
-        lres = {k: v * scales[k] for k, v in lres.items()}
-        rres = {k: v * scales[k] for k, v in rres.items()}
-        lmax, rmax = max(lres.values()), max(rres.values())
-        llab = [k for k, v in lres.items() if v == lmax][0]
-        rlab = [k for k, v in rres.items() if v == rmax][0]
-        choice = [llab, rlab]
+        choice = []
+        for idx in [0, 1]:
+            res = dict(zip(*np.unique(node_tar[conds[idx]], return_counts=True)))
+            res = {k: v * scales[k] for k, v in res.items()}
+            choice.append(max(res, key=res.get))
         preds = np.select(conds, choice)
-        con_mat = sklm.confusion_matrix(list(node_tar), preds, labels=self.out_o)
+        con_mat = self.con_mat(np.array(node_tar), preds, N=len(choice))
         if metric != 'BalAcc':
             con_mat += bcon_mat
         score = self.calc_score(con_mat, metric, o_score=o_scores)
         return '>= ' + str(1 - score)
+
+    def con_mat(self, y_true, y_pred, N=None):
+        y_true, y_pred = y_true.reshape(-1), y_pred.reshape(-1)
+        if (N is None):
+            N = max(max(y_true), max(y_pred)) + 1
+        y = N * y_true + y_pred
+        y = np.bincount(y, minlength=N*N)[::-1]
+        y = y.reshape(N, N)
+        return y
 
     def predict(self, preds, results=False, depth=False):
         """Predict the outcome of decision tree"""
