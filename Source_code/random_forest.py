@@ -7,11 +7,12 @@ Description:  Random Forest training code using homebrew decision tree code
 Usage:        %./random_forest.py [options] [JOB_NAME]
 """
 
-from itertools import combinations
+from itertools import combinations, product
 from logging import info
 import os
 from os.path import exists
 import pickle as pkl
+import re
 
 import numpy as np
 import pandas as pd
@@ -22,11 +23,13 @@ from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.utils.multiclass import unique_labels
 import sys
+import warnings
+from time import time
 
 from config import Options
 from ml_tools import DecisionTree, MyEncoder
 
-np.warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore')
 
 # ID values for system state
 NOT_RUN = 0
@@ -42,117 +45,177 @@ class RandomForest(object):
     Single property to hold all information about the RandomForest training,
     process. It can pickle itself at any time, by calling dump_state()
     """
-    def __init__(self, options):
+    def __init__(self, options, activity, metric):
         self.opt = options
+        self.job_name = options.get('job_name')
+        self.activity = activity
+        self.metric = metric
         self.break_down = None
         self.skip = None
         self.enc = None
         self.out_o = None
-        self.data = self.data_prep()
-        self.state = {'init': NOT_RUN,
-                      'data_break': NOT_RUN,
-                      'trained': NOT_RUN}
-        trees = ['Tree_{}'.format(x + 1) for x in range(self.opt.getint('trees'))]
+        self.features = None
+        self.data = None
+        self.data_prep()
+        self.state = {
+            'init': NOT_RUN,
+            'data_break': NOT_RUN,
+            'trained': NOT_RUN,
+            'cleaned': NOT_RUN
+        }
+
+        num_trees = self.opt.getint('trees')
+        trees = [f'Tree_{x + 1}' for x in range(num_trees)]
         self.state.update({x: NOT_RUN for x in trees})
-        self.tree_info = {x: {} for x in list(range(self.opt.getint('trees') + 1)) +  ['Train', 'Test']}
+
+        self.tree_info = {
+            x: {} for x in list(range(num_trees + 1)) + ['Train', 'Test']
+        }
+
         self.state['init'] = FINISHED
 
     def dump_state(self):
         """Write the Forest.state file for the RF training"""
-        info("Writing state file, {}.rfs".format(self.opt.get('job_name')))
-        my_state = open("{}.rfs".format(self.opt.get('job_name')), 'wb')
-        pkl.dump(self, my_state)
-        my_state.close()
+        state_filename = f'{self.job_name}_{self.activity}_{self.metric}.rfs'
+        info(f"Writing state file, {state_filename}")
+        
+        with open(state_filename, 'wb') as my_state:
+            pkl.dump(self, my_state)
 
     def data_prep(self):
-        """Load all nessecary data and prepare it for the decision tree"""
+        """Load all necessary data and prepare it for the decision tree"""
         cross = self.opt.get('cross_column')
-        target = self.opt.get('target')
-        data = pd.read_csv(self.opt.get('target_csv') + '.csv', index_col=False, encoding='latin1')
-        if 'Binding' in target and 'CERAPP' in self.opt.get('target_csv'):
-              counts = data[data['Binding Count'] > 3].index
-        try:
-            data = data[[cross, target]]
-        except KeyError:
-            data = pd.read_csv(self.opt.get('target_csv') + '.csv')
-            data = data[[cross, target]]
+        target = self.activity
+        data = self.load_data(cross, target)
+    
+        self.data = self.clean_data(data, cross)
+    
+        self.enc = self.encode_target()
+        self.out_o = self.enc.transform(self.out_o)
+        self.data['Target'] = self.enc.transform(self.data['Target'].astype('str'))
+    
+        if not self.opt.getbool('pruned'):
+            self.remove_low_variance_features()
+            self.remove_high_similarity_features()
+    
+        self.prepare_dataframe(cross)
+    
+    def load_data(self, cross, target):
+        """Load data from feather files"""
+        data = pd.read_feather(f'{self.opt.get("target_fthr")}.fthr')
+        data = data[[cross, target]]
         data.rename(columns={target: 'Target'}, inplace=True)
-        for csv in self.opt.gettuple('descriptor_csvs'):
-            try:
-                new = pd.read_csv(csv + '.csv', index_col=False)
-            except IOError:
-                new = pd.read_pickle(csv + '.pkl')
-            if new.index.name == cross:
-                new = pd.read_csv(csv + '.csv', index_col=False)
+        for fthr in self.opt.gettuple('descriptor_fthr'):
+            new = pd.read_feather(f'{fthr}.fthr')
             data = data.merge(new, on=cross, how='left')
-        if 'Binding' in target and 'CERAPP' in self.opt.get('target_csv'):
-            data = data[data.index.isin(counts)]
+        return data
+    
+    def clean_data(self, data, cross):
+        """Clean and preprocess data"""
+        data[cross] = data[cross].astype(str)
         data.drop_duplicates(subset=[cross], inplace=True)
         ignore = list(set(self.opt.gettuple('ignore_columns')).intersection(data.columns))
         data = data[[x for x in data.columns if x not in ignore + ['Unnamed: 0']]]
         data = data.dropna(subset=['Target']).reset_index(drop=True)
-        features = data.columns[2:]
-        data = data.dropna(subset=features, how='any').reset_index(drop=True)
+        self.features = data.columns[2:]
+        data = data.dropna(subset=self.features, how='any').reset_index(drop=True)
+        data = self.convert_dataframe_to_int(data)
+        info(f'Using a total of {data.shape[0]} substances')
+        return data
+
+
+    def convert_dataframe_to_int(self, data):
+        base = data.iloc[:, :2]
+
+        #Search for column which are known to be binary
+        pattern = r'^(maccs_F\d{1,4}|fp\d+_F\d{1,4}|PC_F\d{1,4})$'
+        binary_columns = [col for col in data.columns if re.match(pattern, col)]
+        binary = data[binary_columns].astype(int)
+
+        #Find all remaining columns
+        remaining = data.columns[2:].difference(binary_columns)
+        others = data[remaining].astype(float)
+        int_columns = [col for col in others.columns if all(val.is_integer() for val in others[col])]
+        others[int_columns] = others[int_columns].astype(int)
+        data = pd.concat([base, binary, others], axis=1)
+        return data
+
+
+    def encode_target(self):
+        """Encode the target variable and display class encoding"""
+        target = self.data['Target'].astype('str')
         out_o = self.opt.gettuple('output_order')
-        if out_o == ():
-            out_o = sorted(set(data['Target'].astype('str')))
-        endp = sorted(set(data['Target'].astype('str')))
-        out_o = sorted(endp, key=out_o.index)
+        if not out_o:
+            out_o = sorted(set(target))
+        endp = sorted(set(target))
+        self.out_o = tuple(sorted(endp, key=out_o.index))
         enc = MyEncoder()
-        enc.fit(out_o, ordered=True, reverse=True)
+        enc.fit(self.out_o, ordered=True, reverse=True)
         info("================")
         info("Classes Encoded:")
         info("================")
-        mx = len(max([str(x) for x in out_o], key=len))
-        for enc_class in out_o:
-            pads = "{:%s}: {}" % (mx + 1)
+        mx = len(max([str(x) for x in self.out_o], key=len))
+        for enc_class in self.out_o:
+            pads = '{:%s}: {}' % (mx + 1)
             info(pads.format(enc_class, enc.transform([enc_class])[0]))
-        self.out_o = enc.transform(out_o)
-        self.enc = enc
-        data['Target'] = enc.transform(data['Target'].astype('str'))
-        if not self.opt.getbool('pruned'):
-            var = data[features].var()
-            drops = var[var == 0].index
-            data = data.drop(drops, axis=1)
-            features = data.columns[2:]
-            sim, have = pd.DataFrame(index=features, columns=features), {}
-            for feat in features:
-                if sum(data[feat]) not in have.keys():
-                    have[sum(data[feat])] = [feat]
-                else:
-                    have[sum(data[feat])].append(feat)
-            for val in have.values():
-                for i, j in combinations(val, 2):
-                    tan = sklm.jaccard_score(data[i], data[j], average='macro')
-                    if tan == 1:
-                        sim[i][j] = 1
-                        sim[j][i] = 1
-            sim.dropna(how='all', inplace=True)
-            sim.dropna(axis=1, how='all', inplace=True)
-            sim.fillna(value=0, inplace=True)
-            while not sim.empty:
-                max_sim = 0
-                for val in sim.columns:
-                    sims = sum(sim[val])
-                    if sims > max_sim:
-                        max_sim, drops = sims, val
-                drop_col = list(sim.loc[sim[drops] == 1][drops].index)
-                data.drop(labels=drop_col, axis=1, inplace=True)
-                sim.drop(labels=drop_col + [drops], axis=0, inplace=True)
-                sim.drop(labels=drop_col + [drops], axis=1, inplace=True)
-        cols = data.columns.tolist()[2:]
+        return enc
+
+    def remove_low_variance_features(self):
+        """Remove low-variance features from the dataset"""
+        non_zero_var_cols = self.data.columns[2:][self.data.iloc[:, 2:].var() != 0]
+        self.data = self.data.iloc[:, :2].join(self.data[non_zero_var_cols])
+
+    def remove_high_similarity_features(self):
+        """Remove highly similar features using Jaccard similarity"""
+        feature_sums = self.data.sum(axis=0)  # Calculate the sum of each feature column
+        feature_names = feature_sums.index.tolist()
+    
+        # Create a dictionary to group feature names by their sums
+        feature_groups = {}
+        for feature, sum_value in feature_sums.items():
+            if sum_value not in feature_groups:
+                feature_groups[sum_value] = []
+            feature_groups[sum_value].append(feature)
+    
+        # Initialize an empty set to store features to drop
+        features_to_drop = set()
+    
+        # Iterate through groups with the same sum and calculate similarities
+        for sum_value, group in feature_groups.items():
+            if len(group) > 1:
+                # Calculate similarities only for columns within the same group
+                group_data = self.data[group]
+    
+                # Compute Jaccard similarities for pairs within the group
+                for i, j in combinations(group, 2):
+                    intersection = np.sum(group_data[i] & group_data[j])
+                    union = np.sum(group_data[i] | group_data[j])
+                    similarity = intersection / union if union != 0 else 0
+    
+                    # Adjust the threshold as needed
+                    threshold = 1.0
+                    if similarity >= threshold:
+                        # Add all similar features to drop list except the first one
+                        features_to_drop.update(group[1:])
+    
+        # Remove highly similar features from the DataFrame
+        self.data.drop(columns=list(features_to_drop), inplace=True)
+
+    def prepare_dataframe(self, cross):
+        """Prepare the final dataframe for training"""
+        cols = self.data.columns.tolist()[2:]
         self.skip = 1 - 0.02 ** (1 / self.opt.getfloat('trees'))
-        data['Predict'] = pd.Series(0 * len(data), index=data.index)
-        data['Path'] = pd.Series([''] * len(data), index=data.index)
-        data = data[[cross, 'Target', 'Predict', 'Path'] + cols]
-        self.features = [x for x in features if x in data.columns]
-        return data
+        self.data['Predict'] = pd.Series(0 * len(self.data), index=self.data.index)
+        self.data['Path'] = pd.Series([''] * len(self.data), index=self.data.index)
+        self.data = self.data[[cross, 'Target', 'Predict', 'Path'] + cols]
+        self.features = self.data.columns[2:]
 
     def fit(self):
-        """Create the datasets for the RF training and test sets"""
+        """Train the RandomForest model."""
         data, cross = self.data, self.opt.get('cross_column')
         trees = self.opt.getint('trees')
         ranges = range(1, trees + 1)
+    
         if self.state['data_break'] == NOT_RUN:
             self.data_break = pd.DataFrame(np.nan, index=data.index,
                                            columns=self.tree_info.keys())
@@ -160,66 +223,124 @@ class RandomForest(object):
             self.res = data[[cross, 'Target']]
             self.res['Forest'] = 0
             info("Creating training and test sets")
-            ratio = self.opt.getfloat('ratio')
-            _xtr, _xte, ytr, yte = train_test_split([1] * len(data),
-                                                    data['Target'],
-                                                    test_size=ratio,
-                                                    stratify=data['Target'])
-            conds = [data.index.isin(ytr.index), data.index.isin(yte.index)]
-            self.data_break[0] = np.select(conds, ['Tr', 'Te'])
-            tree_data = data[data.index.isin(ytr.index)]
-            for i in ranges:
-                _xtr, _xte, ytr, yte = train_test_split([1] * len(tree_data),
-                                                        tree_data['Target'],
-                                                        test_size=ratio,
-                                                        stratify=tree_data['Target'])
-                conds = [data.index.isin(ytr.index), data.index.isin(yte.index)]
-                self.data_break[i] = np.select(conds, ['Tr', 'Te'])
-            self.data_break[cross] = self.data[cross]
+            self.prepare_data_splits()
             self.state['data_break'] = FINISHED
             self.dump_state()
+    
         max_depth = self.opt.getint('max_depth')
+    
         for i in ranges:
-            if self.state['Tree_{}'.format(i)] == FINISHED:
+            if self.state[f'Tree_{i}'] == FINISHED:
                 continue
-            info("Training Tree {}...".format(i))
             tr_idx = self.data_break[self.data_break[i] == 'Tr'].index
-            try:
-                os.mkdir('Tree_{}'.format(i))
-            except OSError:
-                pass
-            os.chdir('Tree_{}'.format(i))
-            dt = DecisionTree(data[data.index.isin(tr_idx)], cross=cross,
-                              job_name='Tree_{}'.format(i), max_feats=self.skip,
-                              out_o=self.out_o, enc=self.enc)
-            dt.fit(max_depth=max_depth, metric=self.opt.get('metric'))
-            self.predict_all(dt)
-            os.chdir('..')
-            info("Trained Tree {}".format(i))
-            dt.clean_up()
-            self.tree_info[i]['DT'] = dt
-            preds = dt.predict(data.copy()).rename(columns={'Predict': i})
-            self.res = self.res.merge(preds, on=cross)
-            self.state['Tree_{}'.format(i)] = FINISHED
-            self.dump_state()
+            self.train_decision_tree(i, tr_idx, max_depth, cross)
+            self.state[f'Tree_{i}'] = FINISHED
+            if i % 10 == 0:
+                self.dump_state()
+            if i == ranges[-1]:
+                self.dump_state()
+        tree_preds = []
+        for i in ranges:
+            dt = self.tree_info[i]['DT']
+            tree_preds.append(self.predict_all(dt).iloc[:, -1].rename(i))
+
+        self.res = pd.concat([self.res] + tree_preds, axis=1)
+
         classes = self.enc.inverse_transform(self.out_o)
+        combos = [f'{x}_{y}' for (x, y) in product(classes, classes)]
+        cols = [f'{x}_{y}' for (x, y) in product(['Training', 'Testing'], combos)]
+        self.cms = pd.DataFrame(index=['Forest'] + list(ranges), columns=cols)
+
         self.print_results('Tr', ranges, classes)
         self.print_results('Te', ranges, classes)
+    
         self.res['Forest'] = forest_pred(self.res[ranges], 'majority')
         self.print_results('RF', ['Train', 'Test'], classes)
+
+        all_standards = list(self.opt.gettuple('standards'))
+        if all_standards is not None:
+            std_idx = data[data[cross].isin(all_standards)].index
+            standards = self.res[self.res.index.isin(std_idx)]
+            unique_targets = sorted(standards['Target'].unique())
+            i = 0
+            for target in unique_targets:
+                filter_df = standards[standards['Target'] == target]
+                unique_predict = sorted(filter_df['Forest'].unique())
+                for predict in unique_predict:
+                    idxs = ', '.join(map(str, list(filter_df[filter_df['Forest'] == predict].index)))
+                    info(f'Target {target} and Predict {predict}: {idxs}')
+                    i += 1
+            if i > len(unique_targets):
+                info('Not all standards correctly predicted')
+
         self.state['trained'] = FINISHED
-        exit()
         self.dump_state()
+    
+    def prepare_data_splits(self):
+        """Prepare training and test data splits."""
+        data = self.data
+        cross_column = self.opt.get('cross_column')
+        standards = list(self.opt.gettuple('standards'))
+        ratio = self.opt.getfloat('ratio')
+        
+        for i in range(self.opt.getint('trees') + 1):
+            if i == 0:
+                use_data = data
+            elif i == 1:
+                use_data = data[data.index.isin(y_train.index)]
+            
+            # Split data with standards
+            X_train, X_test, y_train, y_test = self.split_data_with_standards(use_data, cross_column, standards, ratio)
+            
+            conds = [data.index.isin(y_train.index), data.index.isin(y_test.index)]
+            self.data_break[i] = np.select(conds, ['Tr', 'Te'])
+        
+        self.data_break[cross_column] = self.data[cross_column]
+        self.dump_state()
+
+    def split_data_with_standards(self, data, cross_column, standards, ratio):
+        """Split the data into training and test sets, ensuring standards are in the training set."""
+        if standards:
+            # Separate data with standards into training set
+            std_idx = data[data[cross_column].isin(standards)]
+            data_split = data[~data.index.isin(std_idx.index)]
+            # Concatenate train and test data for split
+            X_train, X_test, y_train, y_test = train_test_split([1] * data_split.shape[0],
+                                                                data_split['Target'],
+                                                                test_size=ratio,
+                                                                stratify=data_split['Target'])
+            y_train = pd.concat([y_train, std_idx['Target']])
+        else:
+            X_train, X_test, y_train, y_test = train_test_split([1] * data.shape[0],
+                                                                data['Target'],
+                                                                test_size=ratio,
+                                                                stratify=data['Target'])
+        return X_train, X_test, y_train, y_test
+
+    def train_decision_tree(self, tree_index, tr_idx, max_depth, cross):
+        """Train a single Decision Tree."""
+        info(f"Training Tree {tree_index}...")
+        standards = list(self.opt.gettuple('standards'))
+        dt = DecisionTree(self.data[self.data.index.isin(tr_idx)], cross=cross,
+                          job_name=f'Tree_{tree_index}', max_feats=self.skip,
+                          out_o=self.out_o, enc=self.enc, standards=standards)
+        dt.fit(max_depth=max_depth, metric=self.metric)
+        info(f"Trained Tree {tree_index}")
+        self.tree_info[tree_index]['DT'] = {'rules': dt.rules, 'labels': dt.labels}
+
 
     def print_results(self, pref, ranges, classes):
         """Print the results from Random Forest training"""
         names = {'Tr': 'Training', 'Te': 'Testing', 'RF': 'Random Forest'}
         cross = self.opt.get('cross_column')
         out_o = list(self.out_o)
+        true_classes = self.enc.inverse_transform(out_o)
+        seperator = "-" * 36
+
         if len(classes) == 2:
-            info("-------------------------------------")
-            info(names[pref] + ' Basic Data and Stats')
-            info("-------------------------------------")
+            info(seperator)
+            info(f'{names[pref]} Basic Data and Stats')
+            info(seperator)
             info("Tree    TP     FP     TN     FN   Precis Recall")
             info("===== ====== ====== ====== ====== ====== ======")
         base = "%-7s%5d%7d%7d%7d%7.4f%7.4f"
@@ -242,6 +363,17 @@ class RandomForest(object):
                 self.multi_metrics(tar, pred, i, pref)
             labels = sorted(unique_labels(tar, pred), key=out_o.index)
             con_mat = confusion_matrix(tar, pred, labels=labels)
+            for j, actual in zip(true_classes, con_mat):
+                for k, predicted in zip(true_classes, actual):
+                    idx = i
+                    if pref == 'Tr' or i == 'Train':
+                        if i == 'Train':
+                            idx = 'Forest'
+                        self.cms[f'Training_{j}_{k}'][idx] = predicted
+                    elif pref == 'Te' or i == 'Test':
+                        if i == 'Test':
+                            idx = 'Forest'
+                        self.cms[f'Testing_{j}_{k}'][idx] = predicted
             mat = np.array(con_mat.ravel())
             output_mat[i] = {}
             for x, y in zip(labels, con_mat):
@@ -251,9 +383,9 @@ class RandomForest(object):
                 info(base % (i, mat[3], mat[1], mat[0], mat[2],
                              self.tree_info[i][pref + '_pre'],
                              self.tree_info[i][pref + '_rec']))
-        info("-------------------------------------")
-        info(names[pref] + ' Holistic Stats')
-        info("-------------------------------------")
+        info(seperator)
+        info(f'{names[pref]} Holistic Stats')
+        info(seperator)
         if len(classes) == 2:
             info("Tree  Accura BalAcc   F1    F1.5   MCC   Jaccar")
         else:
@@ -267,9 +399,9 @@ class RandomForest(object):
                          ti[pref + '_jac']))
         if pred_id == 'Forest':
             for i in ranges:
-                info("-------------------------------------")
-                info("{} Forest Confusion Matrix".format(i))
-                info("-------------------------------------")
+                info(seperator)
+                info(f"{i} Forest Confusion Matrix")
+                info(seperator)
                 result = output_mat[i]
                 groups = self.enc.inverse_transform(sorted(result.keys(),
                                                            key=out_o.index))
@@ -278,7 +410,7 @@ class RandomForest(object):
                 lens[0] = max(lens)
                 lens = np.clip(lens, 6, max(lens))
                 dash = tuple('=' * (x - 1) for x in lens)
-                spc = ''.join(['%-{}s'.format(x) for x in lens])
+                spc = ''.join([f'%-{x}s' for x in lens])
                 info(spc % names)
                 info(spc % dash)
                 df = pd.DataFrame(0, index=classes, columns=classes)
@@ -290,7 +422,7 @@ class RandomForest(object):
                     info(spc % print_out)
                     for y, v in zip(classes, result[x]):
                         df[y][label] = v
-                df.to_csv(i + '_Forest_cm.csv')
+            self.cms.to_csv('Confusion_matrices.csv')
 
     def metrics(self, tar, pred, i, pref):
         """Calculate relevent metrics for output"""
@@ -322,31 +454,44 @@ class RandomForest(object):
         ti[pref + '_jac'] = sklm.jaccard_score(tar, pred, average='macro')
         self.tree_info[i] = ti
 
+
+    def finalize(self, activity, metric):
+        trees = self.opt.getint('trees')
+        ranges = range(1, trees + 1)
+        all_preds = []
+        for i in ranges:
+            dt = self.tree_info[i]['DT']
+            all_preds.append(self.predict_all(dt).iloc[:, 1:])
+        idx = self.data[self.opt.get('cross_column')]
+        all_pred = pd.concat([idx] + all_preds, keys=['IDX'] + list(ranges), axis=1)
+        all_pred.to_pickle('Full_Predictions.pkl')
+        dir_name = f'{activity}/{metric}'
+        os.makedirs(dir_name, exist_ok=True)
+        os.system(f'mv Full_Predictions.pkl Confusion_matrices.csv *.rfs {dir_name}')
+
     def predict_all(self, dt):
         """Predict all levels of a tree"""
-        rls, preds, labels = dt.rules, self.data.copy(deep=True), dt.labels
+        rls, preds, labels = dt['rules'], self.data.copy(), dt['labels']
         cross = self.opt.get('cross_column')
-        preds['Path'] = pd.Series([''] * len(preds), index=preds.index)
-        old_depth, results = 1, preds[[cross, 'Target']]
+        preds['Path'] = ''
+        path_col = preds.columns.get_loc('Path')
+        old_depth, results = 1, preds[[cross]]
         for path in sorted(rls, key=len):
             depth = len(path) + 1
             if depth > old_depth:
                 results[old_depth] = preds['Path']
-            rule = rls[path]
-            feat, cond, val = rule.split()
-            node = preds[preds['Path'] == path]
-            right = node[node[feat] >= float(val)].index
-            left = node[node[feat] < float(val)].index
-            if cond == '<':
-                right, left = left, right
-            preds.iloc[right, preds.columns.get_loc('Path')] += 'r'
-            preds.iloc[left, preds.columns.get_loc('Path')] += 'l'
+            feat, cond, val = rls[path].split()
+            tname, fname = path + 't', path + 'f'
+            choicelist = [tname, fname]
+            node, val = preds.loc[preds['Path'] == path, feat], float(val)
+            cond_list = [node > val, node <= val]
+            paths = np.select(cond_list, choicelist)
+            preds.iloc[node.index, path_col] = paths
             old_depth = depth
         results[old_depth] = preds['Path']
-        for col in results.columns[2:]:
+        for col in results.columns[1:]:
             results[col] = results[col].apply(lambda x: labels[x])
-        results['Forest'] = results[col]
-        results.to_csv('All_Predictions.csv')
+        return results
  
 
     def predict(self, job_name):
@@ -403,24 +548,22 @@ def create_fp(smi, tp):
                 'MR', #Molar refractivity
                 'MW', #Molecular Weight
                 'TPSA'] #Topological polar surface area
-    fps = pd.Series(0, index=['fp2_F{}'.format(x) for x in range(most[0])] +
-                             ['fp3_F{}'.format(x) for x in range(most[1])] +
-                             ['fp4_F{}'.format(x) for x in range(most[2])] +
-                             ['maccs_F{}'.format(x) for x in range(most[3])] +
-                             ['PC_F{}'.format(x) for x in range(most[4])] +
+    fps = pd.Series(0, index=[f'fp2_F{x}' for x in range(most[0])] +
+                             [f'fp3_F{x}' for x in range(most[1])] +
+                             [f'fp4_F{x}' for x in range(most[2])] +
+                             [f'maccs_F{x}' for x in range(most[3])] +
+                             [f'PC_F{x}' for x in range(most[4])] +
                              tp + mol_desc).astype(float)
     mol = pybel.readstring('smi', smi)
     for key, val in mol.calcdesc().iteritems():
-        if key not in mol_desc:
-            continue
-        fps[key] = val
+        if key in mol_desc:
+            fps[key] = val
     for i, fp in enumerate(['fp2', 'fp3', 'fp4', 'maccs']):
         mfp = mol.calcfp(fptype=fp)
-        for x in mfp.bits:
-            fps['{}_F{}'.format(fp, x)] = 1
+        fps.update({f'{fp}_F{x}': 1 for x in mfp.bits})
     mol = pcp.get_compounds(smi, namespace='smiles', as_dataframe=True).squeeze()
-    for i, bit in enumerate(mol['cactvs_fingerprint']):
-        fps['PC_F{}'.format(i)] = bit
+    pc_fingerprint = mol['cactvs_fingerprint']
+    fps.update({f'PC_F{i}': bit for i, bit in enumerate(pc_fingerprint)})
     return fps
 
 def forest_pred(x, vote):
@@ -431,30 +574,43 @@ def forest_pred(x, vote):
         return x.mean(axis=1).apply(lambda y: int(y + 0.5))
 
 
+def load_or_create_random_forest(job_name, main_opts, activity, metric):
+    rfs_name = f'{job_name}_{activity}_{metric}.rfs'
+    if exists(rfs_name):
+        info("Found previous state: loading RandomForest...")
+        with open(rfs_name, 'rb') as load_rfs:
+            random_forest = pkl.load(load_rfs)
+            random_forest.opt = main_opts
+    elif exists(f'{activity}/{metric}/{rfs_name}'):
+        info('Already trained this activity and metric...')
+        return 1
+    else:
+        info("Starting a new RandomForest training...")
+        random_forest = RandomForest(main_opts, activity, metric)
+        random_forest.dump_state()
+    return random_forest
+
+
 def main():
     """Main Execution of the code"""
     main_opts = Options(code='RF')
-    info("Starting RandomForest {}".format(__version__))
-    job_name= main_opts.get('job_name')
-    rfs_name = '{}.rfs'.format(job_name)
-    if exists(rfs_name):
-        info("Found previous state: loading RandomForest...")
-        load_rfs = open(rfs_name, 'rb')
-        random_forest = pkl.load(load_rfs)
-        random_forest.opt = main_opts
-        load_rfs.close()
-    else:
-        info("Starting a new RandomForest training...")
-        random_forest = RandomForest(main_opts)
-        random_forest.dump_state()
-    info('Succesfully Loaded Data')
-    if not random_forest.state['trained'] == FINISHED:
-        info("RandomForest not trained, training now...")
-        random_forest.fit()
-    if random_forest.opt.getbool('predict'):
-        info("Looking to predict results...")
-        random_forest.predict(job_name)
+    info(f'Starting RandomForest {__version__}')
+    activities = main_opts.gettuple('activity')
+    metrics = main_opts.gettuple('metric')
+    job_name = main_opts.get('job_name')
+    combinations = list(product(activities, metrics))
+    for (activity, metric) in combinations:
+        info(f'Starting RF training for {activity} using {metric}')
+        random_forest = load_or_create_random_forest(job_name, main_opts, activity, metric)
+        if random_forest == 1:
+            continue
+        info('Successfully Loaded Data')
+        if not random_forest.state['trained'] == FINISHED:
+            info("RandomForest not trained, training now...")
+            random_forest.fit()
+        if not random_forest.state['cleaned'] == FINISHED:
+            info('Finalizing RandomForest reslts and cleaning up directory')
+            random_forest.finalize(activity, metric)
 
-
-if __name__ in '__main__':
+if __name__ == '__main__':
     main()

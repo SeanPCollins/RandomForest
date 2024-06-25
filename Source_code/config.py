@@ -9,29 +9,28 @@ command line customisation. Instantiating Options will set up the logging for
 the particular job.
 
 """
-
-__all__ = ['Options']
-
-# Python 3 fix
-try:
-    import configparser
-except ImportError:
-    import ConfigParser as configparser
-import copy
-import logging
 import os
-import re
 import sys
-import textwrap
-# Python 3 fix
-try:
-    from StringIO import StringIO
-except ImportError:
-    from io import StringIO
-from optparse import OptionParser
+import re
+import copy
+import functools
+import logging
 from logging import debug, error, info
+from optparse import OptionParser
+import textwrap
+from io import StringIO
+
+# Third-party libraries
+import configparser
 
 import __main__
+
+CRITICAL_COLOR = '\033[30;41m'
+ERROR_COLOR = '\033[30;41m'
+WARNING_COLOR = '\033[30;43m'
+DEBUG_COLOR = '\033[30;46m'
+INFO_COLOR = '\033[30;42m'
+NORMAL_COLOR = '\033[0m'
 
 
 class Options(object):
@@ -45,20 +44,37 @@ class Options(object):
     otherwise commandline options or changed input files will not be picked up.
 
     """
+    __all__ = ['Options']
+    OPTION_SOURCES = {
+    'A': ('Instance attributes', lambda self, item: object.__getattribute__(self, item)),
+    'C': ('Commandline options', lambda self, item: self.options.__dict__.get(item)),
+    'O': ('Custom -o options', lambda self, item: self.cmdopts.get(item)),
+    'F': ('Jobname.hc per-job settings', lambda self, item: self.job_ini.get('job_config', item)),
+    'S': ('Site_config.ini settings', lambda self, item: self.site_ini.get('site_config', item)),
+    'D': ('Defaults', lambda self, item: self.defaults.get('defaults', item))
+    }
+
     def __init__(self, job_name=None, code=None):
         """Initialize options from all .ini files and the commandline."""
         # use .get{type}() to read attributes, only access args directly
-        self.job_dir = ''
-        self.script_dir = ''
-        self.job_name = job_name
-        self.code = code
-        self.args = []
-        self.options = {}
-        self.cmdopts = {}
-        self._used_options = set()
-        self.defaults = configparser.SafeConfigParser()
-        self.site_ini = configparser.SafeConfigParser()
-        self.job_ini = configparser.SafeConfigParser()
+        initial_attributes = {
+            'job_dir': '',
+            'script_dir': '',
+            'job_name': job_name,
+            'code': code,
+            'args': [],
+            'options': {},
+            'cmdopts': {},
+            '_used_options': set(),
+            'defaults': configparser.SafeConfigParser(),
+            'site_ini': configparser.SafeConfigParser(),
+            'job_ini': configparser.SafeConfigParser()
+        }
+
+        # Use a loop to set the attributes based on the dictionary
+        for attr, value in initial_attributes.items():
+            setattr(self, attr, value)
+
         # populate options
         self._init_paths()
         self.commandline()
@@ -66,101 +82,49 @@ class Options(object):
         self.load_defaults()
         self.load_site_defaults()
         self.load_job_defaults()
-        if self.options.job_type:
-            self.job_type_ini = configparser.SafeConfigParser()
-            self.load_job_type(self.options.job_type)
-        else:
-            self.job_type_ini = NullConfigParser()
-
 
     def get(self, item):
         """Map values from different sources based on priorities."""
-        # report default options differently
-        option_source = 'D'
-        if item in self.__dict__:
-            # Instance attributes, such as job_name and job_dir
-            debug("an attribute: %s" % item)
-            option_source = 'A'
-            value = object.__getattribute__(self, item)
-        elif self.options.__dict__.get(item) is not None:
-            # Commandline options from optparse where option is set
-            debug("an option: %s" % item)
-            option_source = 'C'
-            value = self.options.__dict__[item]
-        elif item in self.cmdopts:
-            # Commandline -o custom key=value options
-            debug("a custom -o option: %s" % item)
-            option_source = 'O'
-            value = self.cmdopts[item]
-        elif self.job_ini.has_option('job_config', item):
-            # jobname.hc per-job setings
-            debug("a job option: %s" % item)
-            option_source = 'F'
-            value = self.job_ini.get('job_config', item)
-        elif self.job_type_ini.has_option('job_type', item):
-            debug("a job_type option: %s" % item)
-            option_source = 'J'
-            value = self.job_type_ini.get('job_type', item)
-        elif self.site_ini.has_option('site_config', item):
-            debug("a site option: %s" % item)
-            value = self.site_ini.get('site_config', item)
-        elif self.defaults.has_option('defaults', item):
-            debug("a default: %s" % item)
-            value = self.defaults.get('defaults', item)
-        else:
-            # Most things have a default, but not always. Error properly.
-            debug("unspecified option: %s" % item)
-            raise AttributeError(item)
-
-        # Show what options are used the first time they are accessed
-        # for the traceability
-        if item not in self._used_options:
-            if option_source == 'D':
-                debug("Default: %s = %s" % (item, value))
-            else:
-                info("Option (%s): %s = %s" % (option_source, item, value))
-            self._used_options.add(item)
-        # we output the raw value here and pass to caller for
-        return value
-
+        # Define a default value in case the option is not found
+        default_value = None
+        # Iterate through the sources in the specified order
+        for source, source_func_info in self.OPTION_SOURCES.items():
+            source_func = source_func_info[1]
+            try:
+                value = source_func(self, item)
+                # If a value is found in the source, return it, if not None
+                if value is not None:
+                    return value
+            except (AttributeError,  configparser.NoOptionError) as e:
+                # Option not found in this source, continue to the next
+                continue
+    
+        # If the option is not found in any source, return the default value
+        return default_value
 
     def getbool(self, item):
-        """
-        Parse option and if the value of item is not already a bool return
-        True for "1", "yes", "true" and "on" and False for "0", "no", "false"
-        and "off". Case-insensitive.
-
-        """
+        """Parse option and return a boolean value."""
         value = self.get(item)
         if isinstance(value, bool):
             return value
-        # Can't use isinstance with basestring to be 2.x and 3.x compatible
-        # fudge it by assuming strings can be lowered
         elif hasattr(value, 'lower'):
-            if value.lower() in ["1", "yes", "true", "on"]:
-                return True
-            elif value.lower() in ["0", "no", "false", "off"]:
-                return False
-            else:
-                # Not a valid bool
-                raise ValueError(value)
+            return value.lower() in ["1", "yes", "true", "on"]
+        elif hasattr(value, 'lower'):
+            return value.lower() not in ["0", "no", "false", "off"]
         else:
             return bool(item)
 
     def getint(self, item):
         """Return item's value as an integer."""
-        value = self.get(item)
-        return int(value)
+        return int(self.get(item))
 
     def getfloat(self, item):
         """Return item's value as a float."""
-        value = self.get(item)
-        return float(value)
+        return float(self.get(item))
 
     def gettuple(self, item, dtype=None):
         """Return item's value interpreted as a tuple of 'dtype' [strings]."""
         value = self.get(item)
-        # Regex strips bracketing so can't nest, but safer than eval
         value = [x for x in re.split('[\s,\(\)\[\]]+', value) if x]
         if dtype is not None:
             return tuple([dtype(x) for x in value])
@@ -182,80 +146,73 @@ class Options(object):
         Setup the logging to terminal and .flog file, with levels as required.
         Must run before any logging calls so we need to access attributes
         rather than using self.get()!
-
+    
         """
-
-        # Quiet always overrides verbose; always at least INFO in .flog
+        # Define log level mappings
+        log_levels = {
+            'silent': (logging.CRITICAL, logging.INFO),
+            'quiet': (logging.ERROR, logging.INFO),
+            'verbose': (logging.DEBUG, logging.DEBUG),
+            'default': (logging.INFO, logging.INFO)
+        }
+    
+        # Determine log levels based on options
         if self.options.silent:
-            stdout_level = logging.CRITICAL
-            file_level = logging.INFO
+            stdout_level, file_level = log_levels['silent']
         elif self.options.quiet:
-            stdout_level = logging.ERROR
-            file_level = logging.INFO
+            stdout_level, file_level = log_levels['quiet']
         elif self.options.verbose:
-            stdout_level = logging.DEBUG
-            file_level = logging.DEBUG
+            stdout_level, file_level = log_levels['verbose']
         else:
-            stdout_level = logging.INFO
-            file_level = logging.INFO
-
-        # Easier to do simple file configuration then add the stdout
+            stdout_level, file_level = log_levels['default']
+    
+        # Configure file logging
         logging.basicConfig(level=file_level,
                             format='[%(asctime)s] %(levelname)s %(message)s',
                             datefmt='%Y%m%d %H:%M:%S',
                             filename=self.job_name + '.flog',
                             filemode='a')
-
-        # Make these uniform widths
-        logging.addLevelName(10, '--')
-        logging.addLevelName(20, '>>')
-        logging.addLevelName(30, '**')
-        logging.addLevelName(40, '!!')
-        logging.addLevelName(50, 'XX')
-
-        if self.options.plain:
-            console = logging.StreamHandler(sys.stdout)
-        else:
-            # Use nice coloured console output
-            console = ColouredConsoleHandler(sys.stdout)
+    
+        # Define custom log level names
+        log_level_names = {10: '--', 20: '>>', 30: '**', 40: '!!', 50: 'XX'}
+        for level, name in log_level_names.items():
+            logging.addLevelName(level, name)
+    
+        # Create a console handler for colored output or plain output
+        console = (logging.StreamHandler(sys.stdout) if self.options.plain
+                   else ColouredConsoleHandler(sys.stdout))
         console.setLevel(stdout_level)
+    
+        # Set the formatter for console output
         formatter = logging.Formatter('%(levelname)s %(message)s')
         console.setFormatter(formatter)
-        # add the handler to the root logger
+    
+        # Add the console handler to the root logger
         logging.getLogger('').addHandler(console)
 
     def commandline(self):
         """Specified options, highest priority."""
         usage = "usage: %prog [options] [COMMAND] JOB_NAME"
         # use description for the script, not for this module
-        parser = OptionParser(usage=usage, version="%prog 0.1",
-                              description=__main__.__doc__)
-        parser.add_option("-v", "--verbose", action="store_true",
-                          dest="verbose",
-                          help="output extra debugging information")
-        parser.add_option("-q", "--quiet", action="store_true",
-                          dest="quiet", help="only output warnings and errors")
-        parser.add_option("-s", "--silent", action="store_true",
-                          dest="silent", help="no terminal output")
-        parser.add_option("-p", "--plain", action="store_true",
-                          dest="plain", help="do not colourise or wrap output")
-        parser.add_option("-o", "--option", action="append", dest="cmdopts",
-                          help="set custom options as key=value pairs")
-        parser.add_option("-i", "--interactive", action="store_true",
-                          dest="interactive", help="enter interactive mode")
-        parser.add_option("-m", "--import", action="store_true",
-                          dest="import", help="try and import old data")
-        parser.add_option("-n", "--no-submit", action="store_true",
-                          dest="no_submit",
-                          help="create input files only, do not run any jobs")
-        parser.add_option("-j", "--job-type", dest="job_type",
-                          help="user preconfigured job settings")
-        parser.add_option("-d", "--daemon", action="store_true", dest="daemon",
-                          help="run [lube] as a server and await input")
-        parser.add_option("-g", "--gas_test", dest="gas_test",
-                          help="Run gas_test program after tarring")
+        parser = OptionParser(usage=usage, version="%prog 0.1", description=__main__.__doc__)
+        
+        options = [
+            ("-v", "--verbose", "output extra debugging information"),
+            ("-q", "--quiet", "only output warnings and errors"),
+            ("-s", "--silent", "no terminal output"),
+            ("-p", "--plain", "do not colorize or wrap output"),
+            ("-i", "--interactive", "enter interactive mode"),
+            ("-m", "--import", "try and import old data"),
+            ("-n", "--no-submit", "create input files only, do not run any jobs"),
+        ]
+    
+        for short_opt, long_opt, help_text in options:
+            parser.add_option(short_opt, long_opt, action="store_true", dest=long_opt.lstrip('-'), help=help_text)
+        parser.add_option("-o", "--option", action="append", dest="option", default=[], metavar="key=value",
+                  help="set custom options as key=value pairs")
+    
         (local_options, local_args) = parser.parse_args()
-
+    
         # job_name may or may not be passed or set initially
         if self.job_name:
             if self.job_name in local_args:
@@ -265,10 +222,10 @@ class Options(object):
         else:
             # Take the last argument as the job name
             self.job_name = local_args.pop()
-
-        # key value options from the command line
-        if local_options.cmdopts is not None:
-            for pair in local_options.cmdopts:
+    
+        # key-value options from the command line
+        if local_options.option is not None:
+            for pair in local_options.option:
                 if '=' in pair:
                     pair = pair.split('=', 1)  # maximum of one split
                     self.cmdopts[pair[0]] = pair[1]
@@ -278,147 +235,111 @@ class Options(object):
         # Args are only the COMMANDS for the run
         self.args = [arg.lower() for arg in local_args]
 
+    def load_config_file(self, file_path, section_name):
+        """
+        Load configuration from a file and section, handling defaults.
+
+        :param file_path: The path to the configuration file.
+        :param section_name: The name of the section in the configuration file.
+        """
+        try:
+            with open(file_path, 'r') as filetemp:
+                config_data = filetemp.read()
+                if not f'[{section_name}]' in config_data.lower():
+                    config_data = f'[{section_name}]\n' + config_data
+                config_data = StringIO(config_data)
+        except IOError:
+            # Handle the case when the file does not exist
+            if section_name == 'defaults':
+                logging.debug('Default options not found! Something is very wrong.')
+            else:
+                logging.debug(f"No {section_name} options found; using defaults")
+            config_data = StringIO(f'[{section_name}]\n')
+
+        if section_name == 'defaults':
+            self.defaults.readfp(config_data)
+        elif section_name == 'site_config':
+            self.site_ini.readfp(config_data)
+        elif section_name == 'job_config':
+            self.job_ini.readfp(config_data)
+
     def load_defaults(self):
         """Load program defaults."""
-        # ConfigParser requires header sections so we add them to a StringIO
-        # of the file if they are missing. 2to3 should also deal with the
-        # renamed modules.
         home_dir = os.path.expanduser('~')
-        default_ini_path = os.path.join('{}/.defaults/'.format(home_dir),
-                                        '{}_defaults.ini'.format(self.code))
-        filetemp = open(default_ini_path, 'r')
-        try:
-            filetemp = open(default_ini_path, 'r')
-            default_ini = filetemp.read()
-            filetemp.close()
-            if not '[defaults]' in default_ini.lower():
-                default_ini = '[defaults]\n' + default_ini
-            default_ini = StringIO(default_ini)
-        except IOError:
-            # file does not exist so we just use a blank string
-            debug('Default options not found! Something is very wrong.')
-            default_ini = StringIO('[defaults]\n')
-        self.defaults.readfp(default_ini)
+        default_ini_path = os.path.join(f'{home_dir}/.defaults/', f'{self.code}_defaults.ini')
+        self.load_config_file(default_ini_path, 'defaults')
 
     def load_site_defaults(self):
         """Find where the script is and load defaults"""
         home_dir = os.path.expanduser('~')
-        site_ini_path = os.path.join('{}/.defaults/'.format(home_dir),
-                                     '{}_site.ini'.format(self.code))
-        try:
-            filetemp = open(site_ini_path, 'r')
-            site_ini = filetemp.read()
-            filetemp.close()
-            if not '[site_config]' in site_ini.lower():
-                site_ini = '[site_config]\n' + site_ini
-            site_ini = StringIO(site_ini)
-        except IOError:
-            # file does not exist so we just use a blank string
-            debug("No site options found; using defaults")
-            site_ini = StringIO('[site_config]\n')
-        self.site_ini.readfp(site_ini)
+        site_ini_path = os.path.join(f'{home_dir}/.defaults/', f'{self.code}_site.ini')
+        self.load_config_file(site_ini_path, 'site_config')
 
     def load_job_defaults(self):
         """Find where the job is running and load defaults"""
-        job_ini_path = os.path.join(self.job_dir, self.job_name + '.hc')
-        try:
-            filetemp = open(job_ini_path, 'r')
-            job_ini = filetemp.read()
-            filetemp.close()
-            if not '[job_config]' in job_ini.lower():
-                job_ini = '[job_config]\n' + job_ini
-            job_ini = StringIO(job_ini)
-            debug("Job options read from %s" % job_ini_path)
-        except IOError:
-            # file does not exist so we just use a blank string
-            debug("No job options found; using defaults")
-            job_ini = StringIO('[job_config]\n')
-        self.job_ini.readfp(job_ini)
-
-    def load_job_type(self, job_type):
-        """Find where the job is running and load defaults"""
-        home_dir = os.path.expanduser('~')
-        job_type_ini_path = os.path.join(home_dir, '.hc', job_type + '.hc')
-        try:
-            filetemp = open(job_type_ini_path, 'r')
-            job_type_ini = filetemp.read()
-            filetemp.close()
-            if not '[job_type]' in job_type_ini.lower():
-                job_type_ini = '[job_type]\n' + job_type_ini
-            job_type_ini = StringIO(job_type_ini)
-            debug("Job type options read from %s" % job_type_ini_path)
-        except IOError:
-            # file does not exist so we just use a blank string
-            error("Job type '%s' specified but options file '%s' not found" %
-                  (job_type, job_type_ini_path))
-            job_type_ini = StringIO('[job_config]\n')
-        self.job_type_ini.readfp(job_type_ini)
+        job_ini_path = os.path.join(self.job_dir, f'{self.job_name}.hc')
+        self.load_config_file(job_ini_path, 'job_config')
 
 def options_test():
     """Try and read a few options from different sources."""
     testopts = Options()
-    print(testopts.get('job_name'))
-    print(testopts.get('cmdopts'))
-    print(testopts.get('args'))
-    print(testopts.get('verbose'))
-    print(testopts.get('script_dir'))
-    print(testopts.getbool('interactive'))
-    for arg in testopts.get('args'):
-        print('%s: %s' % (arg, testopts.get(arg)))
-        try:
-            print(testopts.getbool(arg))
-        except ValueError:
-            print('%s is not a bool' % arg)
-        try:
-            print(testopts.getint(arg))
-        except ValueError:
-            print('%s is not an int' % arg)
-        try:
-            print(testopts.getfloat(arg))
-        except ValueError:
-            print('%s is not a float' % arg)
-        try:
-            print(testopts.gettuple(arg))
-        except ValueError:
-            print('%s is not a tuple' % arg)
+    option_names = ['job_name', 'cmdopts', 'args', 'verbose', 'script_dir', 'interactive']
+
+    for option_name in option_names:
+        option_value = testopts.get(option_name)
+        print(f"{option_name}: {option_value}")
+
+        if option_name == 'args':
+            for arg in option_value:
+                print(f'{arg}: {option_value}')
+                try:
+                    print(f"{arg} as bool: {testopts.getbool(arg)}")
+                except ValueError:
+                    print(f"{arg} is not a bool")
+                try:
+                    print(f"{arg} as int: {testopts.getint(arg)}")
+                except ValueError:
+                    print(f"{arg} is not an int")
+                try:
+                    print(f"{arg} as float: {testopts.getfloat(arg)}")
+                except ValueError:
+                    print(f"{arg} is not a float")
+                try:
+                    print(f"{arg} as tuple: {testopts.gettuple(arg)}")
+                except ValueError:
+                    print(f"{arg} is not a tuple")
+
     print(testopts.get('not an option'))
 
 
 class ColouredConsoleHandler(logging.StreamHandler):
-    """Makes colourised and wrapped output for the console."""
+    """Makes colorized and wrapped output for the console."""
+    COLOR_MAP = {
+        50: CRITICAL_COLOR,  # CRITICAL / FATAL
+        40: ERROR_COLOR,     # ERROR
+        30: WARNING_COLOR,   # WARNING
+        20: INFO_COLOR,      # INFO
+        10: DEBUG_COLOR,     # DEBUG
+    }
+
     def emit(self, record):
-        """Colourise and emit a record."""
-        # Need to make a actual copy of the record
-        # to prevent altering the message for other loggers
+        """Colorize and emit a record."""
+        # Make a copy of the record to prevent altering the message for other loggers
         myrecord = copy.copy(record)
         levelno = myrecord.levelno
-        if levelno >= 50:  # CRITICAL / FATAL
-            front = '\033[30;41m'  # black/red
-        elif levelno >= 40:  # ERROR
-            front = '\033[30;41m'  # black/red
-        elif levelno >= 30:  # WARNING
-            front = '\033[30;43m'  # black/yellow
-        elif levelno >= 20:  # INFO
-            front = '\033[30;42m'  # black/green
-        elif levelno >= 10:  # DEBUG
-            front = '\033[30;46m'  # black/cyan
-        else:  # NOTSET and anything else
-            front = '\033[0m'  # normal
-
-        myrecord.levelname = '%s%s\033[0m' % (front, myrecord.levelname)
+        front = self.COLOR_MAP.get(levelno, NORMAL_COLOR)
+        myrecord.levelname = f'{front}{myrecord.levelname}{NORMAL_COLOR}'
         logging.StreamHandler.emit(self, myrecord)
 
-
-class NullConfigParser(object):
+class NullConfigParser(configparser.SafeConfigParser):
     """Use in place of a blank ConfigParser that has no options."""
-    def __init__(self, *args, **kwargs):
-        """This is empty, so do nothing."""
-        pass
+    
+    def __init__(self):
+        super().__init__()
 
-    def has_option(*args, **kwargs):
-        """Always return Fasle as there are no options."""
+    def has_option(self, section, option):
+        """Always return False as there are no options."""
         return False
-
 
 if __name__ == '__main__':
     options_test()
